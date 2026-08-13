@@ -8,7 +8,7 @@ const si = require('systeminformation');
 const PORT = Number(process.env.PORT || 4280);
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC = path.join(__dirname, 'public');
-const APP_VERSION = '2026.08.14.1';
+const APP_VERSION = '2026.08.14.2';
 
 let lastNet = null;
 let lastAt = Date.now();
@@ -125,7 +125,8 @@ async function googleCreateEvent(title, start, minutes = 60) {
   const finish = new Date(begin.getTime() + minutes * 60000);
   return googleApi('https://www.googleapis.com/calendar/v3/calendars/primary/events', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ summary: title, start: { dateTime: begin.toISOString() }, end: { dateTime: finish.toISOString() }, reminders: { useDefault: true } }) });
 }
-function formatPcStatus(d) { return `CPU ${Math.round(d.cpu.usage)}%${d.cpu.temp != null ? ` / ${Math.round(d.cpu.temp)}°C` : ''}, GPU ${d.gpu ? `${Math.round(d.gpu.usage)}% / ${Math.round(d.gpu.temp)}°C` : 'offline'}, RAM ${Math.round(d.memory.usage)}%, download ${rate(d.network.down)} Mbps, upload ${rate(d.network.up)} Mbps.`; }
+function formatRate(bytesPerSecond) { const mbps = Number(bytesPerSecond || 0) * 8 / 1e6; return mbps.toFixed(mbps < 10 ? 2 : 1); }
+function formatPcStatus(d) { return `CPU ${Math.round(d.cpu.usage)}%${d.cpu.temp != null ? ` / ${Math.round(d.cpu.temp)}°C` : ''}, GPU ${d.gpu ? `${Math.round(d.gpu.usage)}% / ${Math.round(d.gpu.temp)}°C` : 'offline'}, RAM ${Math.round(d.memory.usage)}%, download ${formatRate(d.network.down)} Mbps, upload ${formatRate(d.network.up)} Mbps.`; }
 function addConversation(role, content) { agentData.conversations.push({ role, content, at: Date.now() }); agentData.conversations = agentData.conversations.slice(-40); saveAgentData(); }
 function safeOpen(name) {
   const apps = { notepad: 'notepad.exe', bloco: 'notepad.exe', calculadora: 'calc.exe', calculator: 'calc.exe', explorer: 'explorer.exe', arquivos: 'explorer.exe', taskmgr: 'taskmgr.exe', tarefas: 'taskmgr.exe', discord: `${process.env.LOCALAPPDATA || ''}\\Discord\\Update.exe`, steam: 'steam.exe', spotify: 'spotify.exe', navegador: 'msedge.exe', edge: 'msedge.exe', brave: 'brave.exe' };
