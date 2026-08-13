@@ -4,6 +4,7 @@ sensor-bridge/obj/
 tools/__pycache__/
 nightwatch.settings.json
 nightwatch.history.json
+jarvis.agent.json
 NIGHTWATCH.lnk
 *.user
 *.suo

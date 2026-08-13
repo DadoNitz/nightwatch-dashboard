@@ -20,6 +20,12 @@
 
 Para instalar em uma máquina nova, execute `Install-NIGHTWATCH.ps1` como usuário do Windows. Para sensores e controle térmico, autorize o NIGHTWATCH como administrador quando solicitado.
 
+## JARVIS PWA
+
+Abra `http://127.0.0.1:4280/jarvis` no navegador. O PWA oferece chat e voz pelo navegador, comandos seguros para o PC e lembretes locais. No iPhone, publique o servidor por HTTPS em uma rede/túnel privado e use Safari → Compartilhar → Adicionar à Tela de Início; PWAs adicionados à tela inicial podem receber Web Push no iOS 16.4+.
+
+Para conectar Gmail e Google Calendar, configure `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` e opcionalmente `GOOGLE_REDIRECT_URI` no ambiente do servidor. O Jarvis usa OAuth e não recebe sua senha. O agente local aceita somente ferramentas allowlistadas; comandos administrativos, envio de email e ações destrutivas não são executados automaticamente.
+
 ## NIGHTWATCH // console operacional
 
 - `O` abre a OPS CONSOLE com latencia, perda de pacotes, interface ativa, top de processos e alertas.

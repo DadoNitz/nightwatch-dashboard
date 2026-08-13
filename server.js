@@ -2,12 +2,13 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
+const crypto = require('crypto');
 const si = require('systeminformation');
 
 const PORT = Number(process.env.PORT || 4280);
-const HOST = '127.0.0.1';
+const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC = path.join(__dirname, 'public');
-const APP_VERSION = '2026.08.13.2';
+const APP_VERSION = '2026.08.14.1';
 
 let lastNet = null;
 let lastAt = Date.now();
@@ -55,6 +56,109 @@ const historyFile = path.join(__dirname, 'nightwatch.history.json');
 let longHistory = [];
 try { longHistory = JSON.parse(fs.readFileSync(historyFile, 'utf8')); if (!Array.isArray(longHistory)) longHistory = []; } catch {}
 let historyDirty = false;
+
+const agentDataFile = path.join(__dirname, 'jarvis.agent.json');
+let agentData = { token: crypto.randomBytes(24).toString('hex'), reminders: [], conversations: [], google: null };
+try { agentData = { ...agentData, ...JSON.parse(fs.readFileSync(agentDataFile, 'utf8')) }; } catch {}
+function saveAgentData() { try { fs.writeFileSync(agentDataFile, JSON.stringify(agentData, null, 2)); } catch (err) { console.error('Falha ao salvar dados do Jarvis:', err.message); } }
+saveAgentData();
+
+const googleScopes = [
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.compose',
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/calendar.readonly'
+];
+const googleRedirect = process.env.GOOGLE_REDIRECT_URI || `http://127.0.0.1:${PORT}/auth/google/callback`;
+
+function json(res, status, body) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(body)); }
+function agentAuthorized(req) {
+  if (HOST === '127.0.0.1' && (req.socket.remoteAddress === '127.0.0.1' || req.socket.remoteAddress === '::1')) return true;
+  const auth = String(req.headers.authorization || '');
+  return auth === `Bearer ${agentData.token}`;
+}
+function requireAgent(req, res) { if (agentAuthorized(req)) return true; json(res, 401, { ok: false, error: 'Jarvis não autorizado. Use o token de pareamento.' }); return false; }
+function decodeBase64Url(value) { return Buffer.from(String(value || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'); }
+function extractHeader(headers, name) { return (headers || []).find(h => String(h.name).toLowerCase() === name.toLowerCase())?.value || ''; }
+function googleConfigured() { return Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET); }
+function googleAuthUrl() {
+  const params = new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID || '', redirect_uri: googleRedirect, response_type: 'code', access_type: 'offline', prompt: 'consent', scope: googleScopes.join(' ') });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+}
+async function googleToken() {
+  if (!agentData.google?.access_token) return null;
+  if (agentData.google.expires_at && agentData.google.expires_at > Date.now() + 60000) return agentData.google.access_token;
+  if (!agentData.google.refresh_token || !googleConfigured()) return null;
+  const response = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID, client_secret: process.env.GOOGLE_CLIENT_SECRET, refresh_token: agentData.google.refresh_token, grant_type: 'refresh_token' }) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error_description || 'Falha ao renovar Google OAuth');
+  agentData.google = { ...agentData.google, ...data, expires_at: Date.now() + Number(data.expires_in || 3600) * 1000 };
+  saveAgentData();
+  return agentData.google.access_token;
+}
+async function googleApi(url, options = {}) {
+  const token = await googleToken();
+  if (!token) throw new Error('Google não conectado. Abra a tela de conexão do Jarvis.');
+  const response = await fetch(url, { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` } });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || `Google API HTTP ${response.status}`);
+  return data;
+}
+async function googleInbox(query = 'is:unread newer_than:7d') {
+  const list = await googleApi(`https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8&q=${encodeURIComponent(query)}`);
+  const messages = [];
+  for (const item of list.messages || []) {
+    const full = await googleApi(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${item.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`);
+    const headers = full.payload?.headers || [];
+    messages.push({ id: item.id, from: extractHeader(headers, 'From'), subject: extractHeader(headers, 'Subject'), date: extractHeader(headers, 'Date'), snippet: full.snippet || '' });
+  }
+  return messages;
+}
+async function googleCalendar() {
+  const now = new Date();
+  const end = new Date(now.getTime() + 7 * 86400000);
+  const data = await googleApi(`https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(now.toISOString())}&timeMax=${encodeURIComponent(end.toISOString())}&maxResults=15`);
+  return (data.items || []).map(e => ({ id: e.id, title: e.summary || '(sem título)', start: e.start?.dateTime || e.start?.date, end: e.end?.dateTime || e.end?.date, location: e.location || '' }));
+}
+async function googleCreateEvent(title, start, minutes = 60) {
+  const begin = new Date(start);
+  const finish = new Date(begin.getTime() + minutes * 60000);
+  return googleApi('https://www.googleapis.com/calendar/v3/calendars/primary/events', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ summary: title, start: { dateTime: begin.toISOString() }, end: { dateTime: finish.toISOString() }, reminders: { useDefault: true } }) });
+}
+function formatPcStatus(d) { return `CPU ${Math.round(d.cpu.usage)}%${d.cpu.temp != null ? ` / ${Math.round(d.cpu.temp)}°C` : ''}, GPU ${d.gpu ? `${Math.round(d.gpu.usage)}% / ${Math.round(d.gpu.temp)}°C` : 'offline'}, RAM ${Math.round(d.memory.usage)}%, download ${rate(d.network.down)} Mbps, upload ${rate(d.network.up)} Mbps.`; }
+function addConversation(role, content) { agentData.conversations.push({ role, content, at: Date.now() }); agentData.conversations = agentData.conversations.slice(-40); saveAgentData(); }
+function safeOpen(name) {
+  const apps = { notepad: 'notepad.exe', bloco: 'notepad.exe', calculadora: 'calc.exe', calculator: 'calc.exe', explorer: 'explorer.exe', arquivos: 'explorer.exe', taskmgr: 'taskmgr.exe', tarefas: 'taskmgr.exe', discord: `${process.env.LOCALAPPDATA || ''}\\Discord\\Update.exe`, steam: 'steam.exe', spotify: 'spotify.exe', navegador: 'msedge.exe', edge: 'msedge.exe', brave: 'brave.exe' };
+  const key = String(name || '').toLowerCase().trim();
+  const target = apps[key];
+  if (!target) throw new Error('Aplicativo fora da lista segura. Posso abrir: navegador, Discord, Steam, Spotify, explorador, bloco de notas, calculadora ou gerenciador de tarefas.');
+  execFile(target, [], { windowsHide: true }, err => { if (err) console.error('Falha ao abrir app:', err.message); });
+  return `Abrindo ${name}.`;
+}
+function parseReminder(text) {
+  const relative = text.match(/(?:em|daqui a)\s+(\d+)\s*(minutos?|horas?|dias?)/i);
+  if (!relative) return null;
+  const amount = Number(relative[1]);
+  const unit = relative[2].toLowerCase();
+  const ms = unit.startsWith('hora') ? amount * 3600000 : unit.startsWith('dia') ? amount * 86400000 : amount * 60000;
+  const clean = text.replace(/(?:me\s+)?lembre[- ]?me/i, '').replace(/(?:em|daqui a)\s+\d+\s*(?:minutos?|horas?|dias?)/i, '').replace(/^\s*(de|para)\s+/i, '').trim();
+  return { text: clean || 'Lembrete do Jarvis', dueAt: Date.now() + ms };
+}
+async function runAgentCommand(input) {
+  const text = String(input || '').trim();
+  const lower = text.toLowerCase();
+  if (!text) return 'Diga o que você precisa.';
+  if (/^(ajuda|help|o que você pode|comandos)/i.test(text)) return 'Posso consultar o PC, abrir aplicativos seguros, listar lembretes, criar lembretes, consultar Gmail e agenda, criar eventos no Calendar e responder por voz.';
+  const reminder = parseReminder(text);
+  if (reminder) { agentData.reminders.push({ id: crypto.randomUUID(), ...reminder, done: false }); saveAgentData(); return `Lembrete criado para ${new Date(reminder.dueAt).toLocaleString('pt-BR')}: ${reminder.text}.`; }
+  if (/lembretes?|reminders?/i.test(lower)) { const pending = agentData.reminders.filter(r => !r.done); return pending.length ? pending.map(r => `• ${r.text} — ${new Date(r.dueAt).toLocaleString('pt-BR')}`).join('\n') : 'Você não tem lembretes pendentes.'; }
+  if (/^(abra|abrir|inicie|iniciar|launch)/i.test(lower)) return safeOpen(text.replace(/^(abra|abrir|inicie|iniciar|launch)\s+/i, '').replace(/o |a /i, ''));
+  if (/status|saúde|temperatura|cpu|gpu|computador|pc/i.test(lower)) { const d = cache || await refresh(); return formatPcStatus(d); }
+  if (/agenda|calendário|compromissos|eventos/i.test(lower)) { const events = await googleCalendar(); return events.length ? events.map(e => `• ${e.title} — ${new Date(e.start).toLocaleString('pt-BR')}${e.location ? ` (${e.location})` : ''}`).join('\n') : 'Não há eventos nos próximos 7 dias.'; }
+  if (/email|gmail|caixa de entrada|mensagens/i.test(lower)) { const messages = await googleInbox(); return messages.length ? messages.map(m => `• ${m.subject || '(sem assunto)'} — ${m.from}\n  ${m.snippet}`).join('\n') : 'Nenhum email recente encontrado.'; }
+  if (/^crie|agende|marque/i.test(lower) && /evento|reunião|compromisso/i.test(lower)) return 'Posso criar eventos no Google Calendar, mas preciso de título e horário exatos. Exemplo: “agende reunião amanhã às 14h”.';
+  return 'Entendi, mas ainda não tenho uma ferramenta segura para essa ação. Tente “status do PC”, “abra o Discord”, “me lembre em 20 minutos de…”, “ver minha agenda” ou “ler meus emails”.';
+}
 
 function nvidia() {
   return new Promise((resolve) => {
@@ -445,11 +549,12 @@ async function refresh() {
 }
 
 function sendFile(req, res) {
-  const rel = req.url === '/' ? 'index.html' : req.url.split('?')[0].replace(/^\/+/, '');
+  const pathname = new URL(req.url, `http://${HOST}:${PORT}`).pathname;
+  const rel = pathname === '/' ? 'index.html' : pathname === '/jarvis' ? 'jarvis.html' : pathname.replace(/^\/+/, '');
   const file = path.resolve(PUBLIC, rel);
   if (!file.startsWith(PUBLIC) || !fs.existsSync(file)) { res.writeHead(404); return res.end('Not found'); }
   const ext = path.extname(file);
-  const types = {'.html':'text/html; charset=utf-8','.css':'text/css','.js':'application/javascript'};
+  const types = {'.html':'text/html; charset=utf-8','.css':'text/css','.js':'application/javascript','.json':'application/json','.webmanifest':'application/manifest+json','.png':'image/png','.svg':'image/svg+xml'};
   res.writeHead(200, {'Content-Type': types[ext] || 'application/octet-stream', 'Cache-Control':'no-store'});
   fs.createReadStream(file).pipe(res);
 }
@@ -464,9 +569,47 @@ function readJson(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  if (req.url === '/auth/google') {
+    if (!googleConfigured()) { res.writeHead(503, {'Content-Type':'text/plain; charset=utf-8'}); res.end('Configure GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no ambiente do servidor.'); return; }
+    res.writeHead(302, { Location: googleAuthUrl() }); res.end(); return;
+  }
+  if (req.url.startsWith('/auth/google/callback')) {
+    try {
+      const params = new URL(req.url, `http://${HOST}:${PORT}`).searchParams;
+      if (params.get('error')) throw new Error(params.get('error_description') || params.get('error'));
+      const response = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: new URLSearchParams({ code: params.get('code') || '', client_id: process.env.GOOGLE_CLIENT_ID || '', client_secret: process.env.GOOGLE_CLIENT_SECRET || '', redirect_uri: googleRedirect, grant_type: 'authorization_code' }) });
+      const data = await response.json(); if (!response.ok) throw new Error(data.error_description || 'Falha no login Google');
+      agentData.google = { ...data, expires_at: Date.now() + Number(data.expires_in || 3600) * 1000 }; saveAgentData(); res.writeHead(302, { Location: '/jarvis?connected=google' }); res.end();
+    } catch (e) { res.writeHead(500, {'Content-Type':'text/html; charset=utf-8'}); res.end(`<h1>Falha ao conectar Google</h1><p>${String(e.message).replace(/[<>]/g, '')}</p><p><a href="/jarvis">Voltar ao Jarvis</a></p>`); }
+    return;
+  }
   if (req.url.startsWith('/api/version')) {
     res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify({ version: APP_VERSION }));
     return;
+  }
+  if (req.url.startsWith('/api/agent/pairing')) {
+    json(res, 200, { ok: true, token: agentData.token, host: HOST, port: PORT, googleConfigured: googleConfigured(), googleConnected: Boolean(agentData.google?.refresh_token || agentData.google?.access_token) });
+    return;
+  }
+  if (req.url.startsWith('/api/agent/status')) {
+    if (!requireAgent(req, res)) return;
+    json(res, 200, { ok: true, agent: 'JARVIS', version: APP_VERSION, host: HOST, port: PORT, googleConfigured: googleConfigured(), googleConnected: Boolean(agentData.google?.refresh_token || agentData.google?.access_token), reminders: agentData.reminders.filter(r => !r.done).length, capabilities: ['pc.status', 'pc.open.safe', 'reminders.local', 'gmail.read', 'calendar.read', 'calendar.create'] });
+    return;
+  }
+  if (req.url.startsWith('/api/agent/command') && req.method === 'POST') {
+    if (!requireAgent(req, res)) return;
+    try { const body = await readJson(req); const input = String(body.text || body.command || ''); addConversation('user', input); const answer = await runAgentCommand(input); addConversation('assistant', answer); json(res, 200, { ok: true, answer, at: Date.now() }); }
+    catch (e) { json(res, 400, { ok: false, error: e.message }); }
+    return;
+  }
+  if (req.url.startsWith('/api/agent/reminders')) {
+    if (!requireAgent(req, res)) return;
+    if (req.method === 'GET') { json(res, 200, { reminders: agentData.reminders.filter(r => !r.done) }); return; }
+    if (req.method === 'DELETE') { const id = new URL(req.url, `http://${HOST}:${PORT}`).searchParams.get('id'); const item = agentData.reminders.find(r => r.id === id); if (item) item.done = true; saveAgentData(); json(res, 200, { ok: true }); return; }
+  }
+  if (req.url.startsWith('/api/agent/conversation')) {
+    if (!requireAgent(req, res)) return;
+    json(res, 200, { messages: agentData.conversations.slice(-30) }); return;
   }
   if (req.url.startsWith('/api/hardware')) {
     try { const data = hardwareCache.at ? hardwareCache : await refreshHardware(); res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(data)); }

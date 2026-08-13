@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $healthUrl = 'http://127.0.0.1:4280/api/stats'
 $panelUrl = 'http://127.0.0.1:4280'
-$expectedVersion = '2026.08.13.1'
+$expectedVersion = '2026.08.14.1'
 Set-Location -LiteralPath $appDir
 
 function Show-NightwatchError([string]$message) {
