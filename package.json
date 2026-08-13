@@ -1,6 +1,6 @@
 {
   "name": "pc-monitor-dashboard",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "description": "Painel local de telemetria para um monitor dedicado",
   "main": "server.js",
