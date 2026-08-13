@@ -3,7 +3,10 @@ sensor-bridge/bin/
 sensor-bridge/obj/
 tools/__pycache__/
 nightwatch.settings.json
+nightwatch.history.json
 NIGHTWATCH.lnk
 *.user
 *.suo
 .DS_Store
+captures/
+releases/

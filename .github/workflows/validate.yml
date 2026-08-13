@@ -1,0 +1,22 @@
+name: Validate NIGHTWATCH
+
+on:
+  push:
+    branches: [main, agent/**]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: node --check server.js
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet build sensor-bridge/SensorBridge.csproj --configuration Release --nologo

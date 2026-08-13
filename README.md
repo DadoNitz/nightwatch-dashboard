@@ -8,6 +8,18 @@
 - FanControl instalado para temperatura/RPM e controle térmico
 - Driver NVIDIA com `nvidia-smi` para telemetria da GPU NVIDIA
 
+## Recursos da versão 2
+
+- Histórico local de telemetria acessível em `/api/history`.
+- Alertas para temperatura, latência, espaço e saúde SMART dos discos.
+- Diagnóstico de Node.js, .NET, FanControl, NVIDIA SMI, ponte de sensores e TShark.
+- Rede avançada agrupada por processo e conexões externas.
+- Captura opcional limitada a 60 segundos quando Wireshark/Npcap + TShark estão instalados.
+- `Install-NIGHTWATCH.ps1` prepara dependências, compila sensores e cria o atalho de inicialização.
+- `Release-NIGHTWATCH.ps1` cria um ZIP distribuível para Windows.
+
+Para instalar em uma máquina nova, execute `Install-NIGHTWATCH.ps1` como usuário do Windows. Para sensores e controle térmico, autorize o NIGHTWATCH como administrador quando solicitado.
+
 ## NIGHTWATCH // console operacional
 
 - `O` abre a OPS CONSOLE com latencia, perda de pacotes, interface ativa, top de processos e alertas.

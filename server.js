@@ -7,7 +7,7 @@ const si = require('systeminformation');
 const PORT = Number(process.env.PORT || 4280);
 const HOST = '127.0.0.1';
 const PUBLIC = path.join(__dirname, 'public');
-const APP_VERSION = '2026.08.13.1';
+const APP_VERSION = '2026.08.13.2';
 
 let lastNet = null;
 let lastAt = Date.now();
@@ -24,6 +24,14 @@ let processCache = { at: 0, list: [] };
 let processCollecting = null;
 let networkHealthCache = { at: 0, target: '1.1.1.1', latency: null, packetLoss: null, interface: null, interfaceName: null, available: [], error: 'Aguardando teste' };
 let networkHealthCollecting = null;
+let diskHealthCache = { at: 0, disks: [], error: 'Aguardando leitura SMART' };
+let diskHealthCollecting = null;
+let diagnosticsCache = { at: 0, checks: [], ok: false };
+let diagnosticsCollecting = null;
+let networkAdvancedCache = { at: 0, groups: [], interfaces: [], capture: null };
+let networkAdvancedCollecting = null;
+let captureProcess = null;
+let captureInfo = { active: false, file: null, startedAt: null, error: null };
 const sensorBridge = path.join(__dirname, 'sensor-bridge', 'bin', 'Release', 'net8.0-windows', 'Nightwatch.SensorBridge.dll');
 const fanControlExe = 'C:\\Program Files (x86)\\FanControl\\FanControl.exe';
 const fanControlConfig = 'C:\\Program Files (x86)\\FanControl\\Configurations\\userConfig.json';
@@ -31,6 +39,8 @@ const settingsFile = path.join(__dirname, 'nightwatch.settings.json');
 const defaultSettings = {
   profile: 'normal',
   interface: 'auto',
+  historyHours: 24,
+  alertsEnabled: true,
   thresholds: { cpuTemp: 85, gpuTemp: 82, diskUsage: 90, latency: 140 },
   ticker: true,
   theme: 'nightwatch'
@@ -40,6 +50,11 @@ try {
   const saved = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
   settings = { ...settings, ...saved, thresholds: { ...settings.thresholds, ...(saved.thresholds || {}) } };
 } catch {}
+
+const historyFile = path.join(__dirname, 'nightwatch.history.json');
+let longHistory = [];
+try { longHistory = JSON.parse(fs.readFileSync(historyFile, 'utf8')); if (!Array.isArray(longHistory)) longHistory = []; } catch {}
+let historyDirty = false;
 
 function nvidia() {
   return new Promise((resolve) => {
@@ -169,12 +184,131 @@ async function refreshNetworkHealth() {
   return networkHealthCollecting;
 }
 
+function runPowerShell(script, timeout = 6000) {
+  return new Promise((resolve, reject) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], { timeout, windowsHide: true, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      resolve(String(stdout || '').trim());
+    });
+  });
+}
+
+async function diskHealthSnapshot() {
+  const script = "Get-PhysicalDisk | Select-Object FriendlyName,HealthStatus,OperationalStatus,MediaType,Size,DeviceId | ConvertTo-Json -Compress";
+  const raw = await runPowerShell(script);
+  if (!raw) return { at: Date.now(), disks: [], error: 'Nenhum disco físico reportado' };
+  const parsed = JSON.parse(raw);
+  const list = (Array.isArray(parsed) ? parsed : [parsed]).map(d => ({
+    name: d.FriendlyName || `Disk ${d.DeviceId ?? '?'}`,
+    health: d.HealthStatus || 'Unknown',
+    status: Array.isArray(d.OperationalStatus) ? d.OperationalStatus.join(', ') : (d.OperationalStatus || 'Unknown'),
+    media: d.MediaType || 'Unknown',
+    size: Number(d.Size || 0),
+    deviceId: d.DeviceId ?? null
+  }));
+  return { at: Date.now(), disks: list, error: null };
+}
+
+async function refreshDiskHealth() {
+  if (diskHealthCollecting) return diskHealthCollecting;
+  diskHealthCollecting = diskHealthSnapshot()
+    .then(data => (diskHealthCache = data))
+    .catch(err => { diskHealthCache = { ...diskHealthCache, at: Date.now(), error: err.message }; return diskHealthCache; })
+    .finally(() => { diskHealthCollecting = null; });
+  return diskHealthCollecting;
+}
+
+function commandExists(command) {
+  return new Promise(resolve => execFile('where.exe', [command], { timeout: 1800, windowsHide: true }, err => resolve(!err)));
+}
+
+async function diagnosticsSnapshot() {
+  const checks = [];
+  const add = (id, label, ok, detail) => checks.push({ id, label, ok: Boolean(ok), detail: detail || (ok ? 'Disponível' : 'Não encontrado') });
+  add('node', 'Node.js', Boolean(process.version), process.version);
+  add('dotnet', '.NET SDK', await commandExists('dotnet.exe'));
+  add('fancontrol', 'FanControl', fs.existsSync(fanControlExe), fanControlExe);
+  add('nvidia', 'NVIDIA SMI', await commandExists('nvidia-smi.exe'));
+  const tshark = await commandExists('tshark.exe');
+  add('npcap', 'Npcap / TShark', tshark, tshark ? 'Captura avançada disponível' : 'Instale Npcap + Wireshark para ativar');
+  add('sensorBridge', 'Ponte de sensores', fs.existsSync(sensorBridge), sensorBridge);
+  return { at: Date.now(), ok: checks.every(c => c.ok), checks };
+}
+
+async function refreshDiagnostics() {
+  if (diagnosticsCollecting) return diagnosticsCollecting;
+  diagnosticsCollecting = diagnosticsSnapshot()
+    .then(data => (diagnosticsCache = data))
+    .catch(err => { diagnosticsCache = { at: Date.now(), ok: false, checks: [{ id: 'diagnostics', label: 'Diagnóstico', ok: false, detail: err.message }] }; return diagnosticsCache; })
+    .finally(() => { diagnosticsCollecting = null; });
+  return diagnosticsCollecting;
+}
+
+async function networkAdvancedSnapshot() {
+  const connections = connectionCache.at ? connectionCache : await refreshConnections();
+  const groups = new Map();
+  for (const row of connections.rows || []) {
+    const key = row.process || `PID ${row.pid}`;
+    const current = groups.get(key) || { process: key, pid: row.pid, connections: 0, external: 0, ports: new Set(), hosts: new Set() };
+    current.connections += 1;
+    if (row.external) current.external += 1;
+    if (row.remote?.port) current.ports.add(row.remote.port);
+    if (row.remote?.host) current.hosts.add(row.remote.host);
+    groups.set(key, current);
+  }
+  const interfaces = (await si.networkInterfaces()).filter(i => i.operstate === 'up' && !i.internal && (i.ip4 || i.ip6)).map(i => ({ iface: i.iface, name: i.ifaceName || i.iface, speed: i.speed || null, ip4: i.ip4 || null, dhcp: Boolean(i.dhcp), virtual: Boolean(i.virtual) }));
+  return { at: Date.now(), groups: [...groups.values()].sort((a, b) => b.external - a.external || b.connections - a.connections).slice(0, 20).map(g => ({ ...g, ports: [...g.ports], hosts: [...g.hosts].slice(0, 8) })), interfaces, capture: captureInfo };
+}
+
+async function refreshNetworkAdvanced() {
+  if (networkAdvancedCollecting) return networkAdvancedCollecting;
+  networkAdvancedCollecting = networkAdvancedSnapshot()
+    .then(data => (networkAdvancedCache = data))
+    .catch(err => { networkAdvancedCache = { ...networkAdvancedCache, at: Date.now(), error: err.message }; return networkAdvancedCache; })
+    .finally(() => { networkAdvancedCollecting = null; });
+  return networkAdvancedCollecting;
+}
+
+async function startCapture() {
+  if (captureProcess) return captureInfo;
+  if (!(await commandExists('tshark.exe'))) throw new Error('TShark não está instalado. Instale Wireshark com Npcap.');
+  let interfaceIndex = '1';
+  try {
+    const listed = await new Promise((resolve, reject) => execFile('tshark.exe', ['-D'], { timeout: 3000, windowsHide: true }, (err, stdout) => err ? reject(err) : resolve(String(stdout || ''))));
+    const lines = listed.split(/\r?\n/).filter(Boolean);
+    const preferred = settings.interface === 'auto' ? /ethernet|wi-?fi|wireless/i : new RegExp(settings.interface.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    const selected = lines.find(line => preferred.test(line) && !/radmin|hamachi|loopback|teredo|vpn|tunnel/i.test(line)) || lines.find(line => !/radmin|hamachi|loopback|teredo|vpn|tunnel/i.test(line));
+    interfaceIndex = selected?.match(/^\s*(\d+)\./)?.[1] || '1';
+  } catch {}
+  const captureDir = path.join(__dirname, 'captures');
+  fs.mkdirSync(captureDir, { recursive: true });
+  const file = path.join(captureDir, `nightwatch-${new Date().toISOString().replace(/[:.]/g, '-')}.pcapng`);
+  captureProcess = execFile('tshark.exe', ['-i', interfaceIndex, '-a', 'duration:60', '-c', '1000', '-w', file], { windowsHide: true }, (err) => {
+    captureInfo = { ...captureInfo, active: false, error: err?.message || null };
+    captureProcess = null;
+  });
+  captureInfo = { active: true, file, startedAt: Date.now(), interfaceIndex, error: null };
+  return captureInfo;
+}
+
+function stopCapture() {
+  if (captureProcess) { captureProcess.kill(); captureProcess = null; }
+  captureInfo = { ...captureInfo, active: false };
+  return captureInfo;
+}
+
+function persistHistory() {
+  if (!historyDirty) return;
+  try { fs.writeFileSync(historyFile, JSON.stringify(longHistory)); historyDirty = false; } catch (err) { console.error('Falha ao salvar histórico:', err.message); }
+}
+
 function computeAlerts(data) {
   const out = [];
   const t = settings.thresholds;
   if (data?.cpu?.temp != null && data.cpu.temp >= Number(t.cpuTemp)) out.push({ level: 'critical', code: 'CPU_TEMP', message: `CPU em ${Math.round(data.cpu.temp)}°C` });
   if (data?.gpu?.temp != null && data.gpu.temp >= Number(t.gpuTemp)) out.push({ level: 'critical', code: 'GPU_TEMP', message: `GPU em ${Math.round(data.gpu.temp)}°C` });
   for (const disk of data?.disks || []) if (Number(disk.usage) >= Number(t.diskUsage)) out.push({ level: 'warn', code: 'DISK_FULL', message: `${disk.mount || disk.name} em ${Math.round(disk.usage)}%` });
+  for (const disk of diskHealthCache.disks || []) if (!/healthy|online|ok/i.test(`${disk.health} ${disk.status}`)) out.push({ level: 'critical', code: 'DISK_HEALTH', message: `${disk.name}: ${disk.health} / ${disk.status}` });
   if (networkHealthCache.latency != null && networkHealthCache.latency >= Number(t.latency)) out.push({ level: 'warn', code: 'LATENCY', message: `Latência ${networkHealthCache.latency} ms` });
   for (const fan of hardwareCache.fans || []) if (fan.enabled && fan.rpm != null && fan.rpm < 150 && !fan.isPump) out.push({ level: 'critical', code: 'FAN_STOP', message: `${fan.name} abaixo de 150 RPM` });
   return out;
@@ -283,14 +417,20 @@ async function snapshot() {
     gpu,
     disks: fsSize.filter(d => d.size > 0 && !/^(A:|B:)/i.test(d.fs)).map(d => ({ name:d.fs || d.mount, mount:d.mount, used:d.used, size:d.size, usage:d.use })),
     network: { ...speed, totalDown: net.rx, totalUp: net.tx },
-    hardware: hardwareCache
+    hardware: hardwareCache,
+    diskHealth: diskHealthCache
   };
   history.push({ t:now, cpu:data.cpu.usage, gpu:gpu?.usage || 0, down:speed.down, up:speed.up });
   if (history.length > 180) history.shift();
+  longHistory.push({ t: now, cpu: Number(data.cpu.usage.toFixed(1)), gpu: Number((gpu?.usage || 0).toFixed(1)), ram: Number(data.memory.usage.toFixed(1)), down: Number(speed.down.toFixed(0)), up: Number(speed.up.toFixed(0)), cpuTemp: data.cpu.temp == null ? null : Number(data.cpu.temp.toFixed(1)), gpuTemp: gpu?.temp ?? null });
+  const maxHistory = Math.max(360, Math.min(8640, Number(settings.historyHours || 24) * 60));
+  if (longHistory.length > maxHistory) longHistory.splice(0, longHistory.length - maxHistory);
+  historyDirty = true;
   data.networkHealth = networkHealthCache;
   data.processes = processCache;
   data.settings = settings;
-  data.alerts = computeAlerts(data);
+  data.alerts = settings.alertsEnabled === false ? [] : computeAlerts(data);
+  data.historyLong = longHistory.slice(-Math.min(longHistory.length, 720));
   data.history = history;
   return data;
 }
@@ -358,6 +498,40 @@ const server = http.createServer(async (req, res) => {
     catch (e) { res.writeHead(500, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:e.message})); }
     return;
   }
+  if (req.url.startsWith('/api/network/advanced')) {
+    try { const data = networkAdvancedCache.at ? networkAdvancedCache : await refreshNetworkAdvanced(); res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(data)); }
+    catch (e) { res.writeHead(500, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+  if (req.url.startsWith('/api/network/capture/status')) {
+    res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify({ ...captureInfo, tshark: await commandExists('tshark.exe') }));
+    return;
+  }
+  if (req.url.startsWith('/api/network/capture/start') && req.method === 'POST') {
+    try { const data = await startCapture(); res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify({ ok: true, ...data })); }
+    catch (e) { res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({ok:false,error:e.message})); }
+    return;
+  }
+  if (req.url.startsWith('/api/network/capture/stop') && req.method === 'POST') {
+    res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify({ ok: true, ...stopCapture() }));
+    return;
+  }
+  if (req.url.startsWith('/api/disks')) {
+    try { const data = diskHealthCache.at ? diskHealthCache : await refreshDiskHealth(); res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(data)); }
+    catch (e) { res.writeHead(500, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+  if (req.url.startsWith('/api/diagnostics')) {
+    try { const data = diagnosticsCache.at ? diagnosticsCache : await refreshDiagnostics(); res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(data)); }
+    catch (e) { res.writeHead(500, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:e.message})); }
+    return;
+  }
+  if (req.url.startsWith('/api/history')) {
+    const hours = Math.max(1, Math.min(168, Number(new URL(req.url, `http://${HOST}:${PORT}`).searchParams.get('hours') || 24)));
+    const cutoff = Date.now() - hours * 3600 * 1000;
+    res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify({ at: Date.now(), hours, samples: longHistory.filter(s => s.t >= cutoff) }));
+    return;
+  }
   if (req.url.startsWith('/api/settings') && req.method === 'GET') {
     res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(settings));
     return;
@@ -387,10 +561,20 @@ server.listen(PORT, HOST, () => {
   refreshHardware();
   refreshProcesses();
   refreshNetworkHealth();
+  refreshDiskHealth();
+  refreshDiagnostics();
+  refreshNetworkAdvanced();
   setInterval(refresh, 2000).unref();
   setInterval(refreshConnections, 5000).unref();
   setInterval(refreshNews, 15 * 60 * 1000).unref();
   setInterval(refreshHardware, 3000).unref();
   setInterval(refreshProcesses, 5000).unref();
   setInterval(refreshNetworkHealth, 10000).unref();
+  setInterval(refreshDiskHealth, 60000).unref();
+  setInterval(refreshDiagnostics, 30000).unref();
+  setInterval(refreshNetworkAdvanced, 5000).unref();
+  setInterval(persistHistory, 10000).unref();
 });
+
+process.on('SIGINT', () => { persistHistory(); stopCapture(); process.exit(0); });
+process.on('SIGTERM', () => { persistHistory(); stopCapture(); process.exit(0); });
