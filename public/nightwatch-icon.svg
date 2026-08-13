@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="NIGHTWATCH">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="75%">
+      <stop offset="0" stop-color="#0a2b1b"/>
+      <stop offset="1" stop-color="#010403"/>
+    </radialGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="42" fill="url(#bg)" stroke="#103a26" stroke-width="5"/>
+  <path filter="url(#glow)" fill="#20f986" d="M22 82 78 108 108 54 128 110 148 54 178 108 234 82 210 134 234 146 186 154 164 208 128 172 92 208 70 154 22 146 46 134Z"/>
+  <path fill="#021008" d="m87 125 18 10 23-19 23 19 18-10-11 27-30 20-30-20Z" opacity=".55"/>
+  <circle cx="94" cy="142" r="5" fill="#baffd5"/>
+  <circle cx="162" cy="142" r="5" fill="#baffd5"/>
+  <path d="M52 222h152" stroke="#20f986" stroke-width="4" stroke-linecap="round" opacity=".35"/>
+</svg>

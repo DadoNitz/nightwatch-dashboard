@@ -1,0 +1,13 @@
+{
+  "name": "pc-monitor-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Painel local de telemetria para um monitor dedicado",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "systeminformation": "^5.27.11"
+  }
+}

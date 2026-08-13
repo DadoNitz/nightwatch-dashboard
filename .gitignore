@@ -1,0 +1,9 @@
+node_modules/
+sensor-bridge/bin/
+sensor-bridge/obj/
+tools/__pycache__/
+nightwatch.settings.json
+NIGHTWATCH.lnk
+*.user
+*.suo
+.DS_Store
