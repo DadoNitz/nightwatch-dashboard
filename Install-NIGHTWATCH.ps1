@@ -34,4 +34,14 @@ $shortcut.Save()
 $startup = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
 New-Item -ItemType Directory -Force -Path $startup | Out-Null
 Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $startup 'NIGHTWATCH.lnk') -Force
-Write-Host 'NIGHTWATCH instalado. Abra NIGHTWATCH.lnk para iniciar.' -ForegroundColor Green
+
+$watchdogPath = Join-Path $startup 'NIGHTWATCH-Watchdog.lnk'
+$watchdog = $shell.CreateShortcut($watchdogPath)
+$watchdog.TargetPath = (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe')
+$watchdog.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $appDir 'Watchdog-NIGHTWATCH.ps1')`""
+$watchdog.WorkingDirectory = $appDir
+$watchdog.IconLocation = "$(Join-Path $appDir 'nightwatch.ico'),0"
+$watchdog.Description = 'NIGHTWATCH // Local node watchdog'
+$watchdog.Save()
+
+Write-Host 'NIGHTWATCH instalado com inicializacao automatica e watchdog local.' -ForegroundColor Green

@@ -4,10 +4,16 @@
   "short_name": "JARVIS",
   "description": "Agente pessoal seguro para PC, Gmail e agenda",
   "start_url": "/jarvis",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#020604",
   "theme_color": "#020604",
-  "orientation": "portrait",
+  "orientation": "any",
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    { "name": "Status do PC", "short_name": "Status", "url": "/jarvis?command=status%20do%20meu%20PC" },
+    { "name": "Agenda", "short_name": "Agenda", "url": "/jarvis?command=ver%20minha%20agenda" }
+  ],
   "icons": [
     { "src": "/nightwatch-icon.png", "sizes": "256x256", "type": "image/png", "purpose": "any maskable" }
   ]

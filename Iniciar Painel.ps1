@@ -1,8 +1,9 @@
+param([switch]$ServerOnly)
 $ErrorActionPreference = 'Stop'
 $appDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $healthUrl = 'http://127.0.0.1:4280/api/stats'
 $panelUrl = 'http://127.0.0.1:4280'
-$expectedVersion = '2026.08.14.3'
+$expectedVersion = '2026.08.15.0'
 Set-Location -LiteralPath $appDir
 
 function Show-NightwatchError([string]$message) {
@@ -39,7 +40,8 @@ try {
   $versionReady = Test-NightwatchVersion
   if (-not $isAdmin -and (-not $sensorsReady -or -not $versionReady)) {
     $self = $MyInvocation.MyCommand.Path
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$self`""
+    $serverOnlyArgument = if ($ServerOnly) { ' -ServerOnly' } else { '' }
+    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$self`"$serverOnlyArgument"
     exit 0
   }
 
@@ -78,6 +80,8 @@ try {
     }
     if (-not $ready) { throw 'O servidor local não respondeu após 20 segundos.' }
   }
+
+  if ($ServerOnly) { exit 0 }
 
   Add-Type -AssemblyName System.Windows.Forms
   $screens = [System.Windows.Forms.Screen]::AllScreens

@@ -2,12 +2,14 @@ node_modules/
 sensor-bridge/bin/
 sensor-bridge/obj/
 tools/__pycache__/
+.env.local
 nightwatch.settings.json
 nightwatch.history.json
 jarvis.agent.json
 NIGHTWATCH.lnk
 *.user
 *.suo
+*.log
 .DS_Store
 captures/
 releases/

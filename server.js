@@ -5,10 +5,22 @@ const { execFile } = require('child_process');
 const crypto = require('crypto');
 const si = require('systeminformation');
 
+function loadLocalEnv() {
+  const file = path.join(__dirname, '.env.local');
+  try {
+    for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+      const match = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.*)\s*$/);
+      if (!match || process.env[match[1]]) continue;
+      process.env[match[1]] = match[2].replace(/^['"]|['"]$/g, '');
+    }
+  } catch {}
+}
+loadLocalEnv();
+
 const PORT = Number(process.env.PORT || 4280);
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || (process.env.NIGHTWATCH_LAN === '1' ? '0.0.0.0' : '127.0.0.1');
 const PUBLIC = path.join(__dirname, 'public');
-const APP_VERSION = '2026.08.14.3';
+const APP_VERSION = '2026.08.15.0';
 
 let lastNet = null;
 let lastAt = Date.now();
@@ -23,7 +35,7 @@ let hardwareCache = { ok: false, at: 0, cpuTemp: null, fans: [], temperatures: [
 let hardwareCollecting = null;
 let processCache = { at: 0, list: [] };
 let processCollecting = null;
-let networkHealthCache = { at: 0, target: '1.1.1.1', latency: null, packetLoss: null, interface: null, interfaceName: null, available: [], error: 'Aguardando teste' };
+let networkHealthCache = { at: 0, target: '1.1.1.1', latency: null, jitter: null, packetLoss: null, interface: null, interfaceName: null, available: [], error: 'Aguardando teste' };
 let networkHealthCollecting = null;
 let diskHealthCache = { at: 0, disks: [], error: 'Aguardando leitura SMART' };
 let diskHealthCollecting = null;
@@ -42,7 +54,7 @@ const defaultSettings = {
   interface: 'auto',
   historyHours: 24,
   alertsEnabled: true,
-  thresholds: { cpuTemp: 85, gpuTemp: 82, diskUsage: 90, latency: 140 },
+  thresholds: { cpuTemp: 85, gpuTemp: 82, gpuHotspot: 95, hotspotDelta: 25, diskUsage: 90, latency: 140, jitter: 40, packetLoss: 5 },
   ticker: true,
   theme: 'nightwatch'
 };
@@ -58,9 +70,11 @@ try { longHistory = JSON.parse(fs.readFileSync(historyFile, 'utf8')); if (!Array
 let historyDirty = false;
 
 const agentDataFile = path.join(__dirname, 'jarvis.agent.json');
-let agentData = { token: crypto.randomBytes(24).toString('hex'), reminders: [], conversations: [], google: null, settings: { voiceEnabled: false } };
+let agentData = { token: crypto.randomBytes(24).toString('hex'), pairingCode: String(crypto.randomInt(100000, 1000000)), reminders: [], conversations: [], pendingActions: [], google: null, settings: { voiceEnabled: false } };
 try { agentData = { ...agentData, ...JSON.parse(fs.readFileSync(agentDataFile, 'utf8')) }; } catch {}
 agentData.settings = { voiceEnabled: false, ...(agentData.settings || {}) };
+agentData.pendingActions = Array.isArray(agentData.pendingActions) ? agentData.pendingActions : [];
+agentData.pairingCode = /^\d{6}$/.test(String(agentData.pairingCode || '')) ? String(agentData.pairingCode) : String(crypto.randomInt(100000, 1000000));
 function saveAgentData() { try { fs.writeFileSync(agentDataFile, JSON.stringify(agentData, null, 2)); } catch (err) { console.error('Falha ao salvar dados do Jarvis:', err.message); } }
 saveAgentData();
 
@@ -73,8 +87,9 @@ const googleScopes = [
 const googleRedirect = process.env.GOOGLE_REDIRECT_URI || `http://127.0.0.1:${PORT}/auth/google/callback`;
 
 function json(res, status, body) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(body)); }
+function isLoopbackRequest(req) { return ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress); }
 function agentAuthorized(req) {
-  if (HOST === '127.0.0.1' && (req.socket.remoteAddress === '127.0.0.1' || req.socket.remoteAddress === '::1')) return true;
+  if (isLoopbackRequest(req)) return true;
   const auth = String(req.headers.authorization || '');
   return auth === `Bearer ${agentData.token}`;
 }
@@ -137,7 +152,7 @@ async function llmReply(input) {
     ...agentData.conversations.slice(-18).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content) })),
     { role: 'user', content: input }
   ];
-  const response = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4o-mini', messages, temperature: 0.35, max_tokens: 700 }) });
+  const response = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4o-mini', messages, temperature: 0.35, max_tokens: 700 }), signal: AbortSignal.timeout(45000) });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error?.message || `OpenAI HTTP ${response.status}`);
   return data.choices?.[0]?.message?.content?.trim() || null;
@@ -152,26 +167,71 @@ function safeOpen(name) {
 }
 function parseReminder(text) {
   const relative = text.match(/(?:em|daqui a)\s+(\d+)\s*(minutos?|horas?|dias?)/i);
-  if (!relative) return null;
-  const amount = Number(relative[1]);
-  const unit = relative[2].toLowerCase();
-  const ms = unit.startsWith('hora') ? amount * 3600000 : unit.startsWith('dia') ? amount * 86400000 : amount * 60000;
-  const clean = text.replace(/(?:me\s+)?lembre[- ]?me/i, '').replace(/(?:em|daqui a)\s+\d+\s*(?:minutos?|horas?|dias?)/i, '').replace(/^\s*(de|para)\s+/i, '').trim();
-  return { text: clean || 'Lembrete do Jarvis', dueAt: Date.now() + ms };
+  const absoluteDay = text.match(/\b(hoje|amanhã|amanha)\b/i);
+  const absoluteClock = text.match(/\b(?:às|as)\s*(\d{1,2})(?::(\d{2}))?\s*(?:h|horas?)?\b/i) || text.match(/\b(\d{1,2})h(?:(\d{2}))?\b/i);
+  let dueAt = null;
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2].toLowerCase();
+    const ms = unit.startsWith('hora') ? amount * 3600000 : unit.startsWith('dia') ? amount * 86400000 : amount * 60000;
+    dueAt = Date.now() + ms;
+  } else if (/lembre/i.test(text) && absoluteDay && absoluteClock) {
+    const due = new Date();
+    if (!/^hoje$/i.test(absoluteDay[1])) due.setDate(due.getDate() + 1);
+    due.setHours(Number(absoluteClock[1]), Number(absoluteClock[2] || 0), 0, 0);
+    if (due > new Date()) dueAt = due.getTime();
+  }
+  if (dueAt == null) return null;
+  const clean = text.replace(/(?:me\s+)?lembre[- ]?me/i, '').replace(/(?:em|daqui a)\s+\d+\s*(?:minutos?|horas?|dias?)/i, '').replace(/\b(hoje|amanhã|amanha)\b(?:\s+(?:às|as))?\s*\d{1,2}(?::\d{2})?\s*(?:h|horas?)?/i, '').replace(/^\s*(de|para)\s+/i, '').trim();
+  return { text: clean || 'Lembrete do JARVIS', dueAt };
+}
+
+function parseCalendarRequest(text) {
+  if (!/\b(agende|agendar|marque|marcar|crie|criar)\b/i.test(text) || !/\b(evento|reunião|compromisso|consulta|chamada|call)\b/i.test(text)) return null;
+  const day = text.match(/\b(hoje|amanhã|amanha)\b/i)?.[1]?.toLowerCase();
+  const clock = text.match(/\b(?:às|as)\s*(\d{1,2})(?::(\d{2}))?\s*(?:h|horas?)?\b/i) || text.match(/\b(\d{1,2})h(?:(\d{2}))?\b/i);
+  if (!day || !clock) return null;
+  const start = new Date();
+  if (day !== 'hoje') start.setDate(start.getDate() + 1);
+  start.setHours(Number(clock[1]), Number(clock[2] || 0), 0, 0);
+  if (Number.isNaN(start.getTime()) || start <= new Date()) return null;
+  const durationMatch = text.match(/(?:por|durante)\s+(\d+)\s*(minutos?|horas?)/i);
+  const duration = durationMatch ? Number(durationMatch[1]) * (durationMatch[2].toLowerCase().startsWith('hora') ? 60 : 1) : 60;
+  const title = text
+    .replace(/^.*?\b(evento|reunião|compromisso|consulta|chamada|call)\b\s*(?:de|para|sobre)?\s*/i, '')
+    .replace(/\b(hoje|amanhã|amanha)\b.*$/i, '')
+    .trim() || 'Compromisso criado pelo JARVIS';
+  return { type: 'calendar.create', title, start: start.toISOString(), minutes: Math.max(15, Math.min(480, duration)) };
+}
+
+async function confirmPendingAction() {
+  const action = agentData.pendingActions[0];
+  if (!action) return 'Não há nenhuma ação aguardando confirmação.';
+  if (action.type === 'calendar.create') {
+    await googleCreateEvent(action.title, action.start, action.minutes);
+    agentData.pendingActions.shift();
+    saveAgentData();
+    return `Evento criado: ${action.title}, em ${new Date(action.start).toLocaleString('pt-BR')}.`;
+  }
+  return 'A ação pendente não é mais compatível e foi descartada.';
 }
 async function runAgentCommand(input) {
   const text = String(input || '').trim();
   const lower = text.toLowerCase();
   if (!text) return 'Diga o que você precisa.';
+  if (/^(confirmar|confirmo|pode fazer|sim,? pode|sim)$/i.test(lower)) return confirmPendingAction();
+  if (/^(cancelar|cancela|não|nao)$/i.test(lower) && agentData.pendingActions.length) { agentData.pendingActions.shift(); saveAgentData(); return 'Ação cancelada.'; }
   if (/^(ajuda|help|o que você pode|comandos)/i.test(text)) return 'Posso consultar o PC, abrir aplicativos seguros, listar lembretes, criar lembretes, consultar Gmail e agenda, criar eventos no Calendar e responder por voz.';
   const reminder = parseReminder(text);
   if (reminder) { agentData.reminders.push({ id: crypto.randomUUID(), ...reminder, done: false }); saveAgentData(); return `Lembrete criado para ${new Date(reminder.dueAt).toLocaleString('pt-BR')}: ${reminder.text}.`; }
   if (/lembretes?|reminders?/i.test(lower)) { const pending = agentData.reminders.filter(r => !r.done); return pending.length ? pending.map(r => `• ${r.text} — ${new Date(r.dueAt).toLocaleString('pt-BR')}`).join('\n') : 'Você não tem lembretes pendentes.'; }
   if (/^(abra|abrir|inicie|iniciar|launch)/i.test(lower)) return safeOpen(text.replace(/^(abra|abrir|inicie|iniciar|launch)\s+/i, '').replace(/o |a /i, ''));
   if (/status|saúde|temperatura|cpu|gpu|computador|pc/i.test(lower)) { const d = cache || await refresh(); return formatPcStatus(d); }
+  const calendarRequest = parseCalendarRequest(text);
+  if (calendarRequest) { agentData.pendingActions = [calendarRequest]; saveAgentData(); return `Confirma criar “${calendarRequest.title}” em ${new Date(calendarRequest.start).toLocaleString('pt-BR')} por ${calendarRequest.minutes} minutos? Responda “confirmar” ou “cancelar”.`; }
   if (/agenda|calendário|compromissos|eventos/i.test(lower)) { const events = await googleCalendar(); return events.length ? events.map(e => `• ${e.title} — ${new Date(e.start).toLocaleString('pt-BR')}${e.location ? ` (${e.location})` : ''}`).join('\n') : 'Não há eventos nos próximos 7 dias.'; }
   if (/email|gmail|caixa de entrada|mensagens/i.test(lower)) { const messages = await googleInbox(); return messages.length ? messages.map(m => `• ${m.subject || '(sem assunto)'} — ${m.from}\n  ${m.snippet}`).join('\n') : 'Nenhum email recente encontrado.'; }
-  if (/^crie|agende|marque/i.test(lower) && /evento|reunião|compromisso/i.test(lower)) return 'Posso criar eventos no Google Calendar, mas preciso de título e horário exatos. Exemplo: “agende reunião amanhã às 14h”.';
+  if (/^crie|agende|marque/i.test(lower) && /evento|reunião|compromisso/i.test(lower)) return 'Preciso do título, dia e horário. Exemplo: “agende reunião de projeto amanhã às 14h”.';
   if (/^(oi|olá|ola|hey|bom dia|boa tarde|boa noite|tudo bem|obrigado|valeu)/i.test(lower)) {
     if (aiConfigured()) return (await llmReply(text)) || 'Olá. Estou online e pronto para ajudar.';
     return 'Olá. Estou online e pronto para ajudar no PC, nos lembretes e nas integrações disponíveis.';
@@ -192,16 +252,39 @@ function nvidia() {
   });
 }
 
-// `systeminformation.networkStats()` follows the adapter Windows marks as
-// default. VPN software (notably Radmin VPN) can claim that route while the
-// actual internet traffic still uses Ethernet. `netstat -e` reads the TCP/IP
-// stack totals directly, so physical, Wi-Fi and VPN traffic are all covered.
-function networkCounters() {
+const ignoredNetworkInterface = /radmin|hamachi|zerotier|tailscale|loopback|teredo|virtual|vpn|tunnel|hyper-v|vethernet/i;
+
+async function physicalNetworkInterfaces() {
+  const interfaces = await si.networkInterfaces();
+  return interfaces
+    .filter(i => i.operstate === 'up' && !i.internal && !i.virtual && !ignoredNetworkInterface.test(`${i.iface} ${i.ifaceName}`) && (i.ip4 || i.ip6))
+    .sort((a, b) => Number(Boolean(b.dhcp)) - Number(Boolean(a.dhcp)) || Number(b.speed || 0) - Number(a.speed || 0));
+}
+
+async function selectedNetworkInterface() {
+  const candidates = await physicalNetworkInterfaces();
+  return {
+    selected: candidates.find(i => settings.interface !== 'auto' && i.iface === settings.interface) || candidates[0] || null,
+    available: candidates.map(i => ({ iface: i.iface, name: i.ifaceName || i.iface, speed: i.speed || null, ip4: i.ip4 || null }))
+  };
+}
+
+async function networkCounters() {
+  try {
+    const { selected } = await selectedNetworkInterface();
+    if (selected) {
+      const stats = await si.networkStats(selected.iface);
+      const row = Array.isArray(stats) ? stats[0] : stats;
+      if (row && Number.isFinite(Number(row.rx_bytes)) && Number.isFinite(Number(row.tx_bytes))) {
+        return { rx: Number(row.rx_bytes), tx: Number(row.tx_bytes), iface: selected.iface, ifaceName: selected.ifaceName || selected.iface };
+      }
+    }
+  } catch {}
   return new Promise((resolve) => {
     execFile('netstat', ['-e'], { timeout: 1800, windowsHide: true }, (err, out) => {
       if (err || !out) return resolve(lastNet || { rx: 0, tx: 0 });
       const match = out.match(/^\s*Bytes\s+(\d+)\s+(\d+)/mi);
-      resolve(match ? { rx: Number(match[1]), tx: Number(match[2]) } : (lastNet || { rx: 0, tx: 0 }));
+      resolve(match ? { rx: Number(match[1]), tx: Number(match[2]), iface: null, ifaceName: 'TCP/IP GLOBAL' } : (lastNet || { rx: 0, tx: 0 }));
     });
   });
 }
@@ -280,22 +363,19 @@ async function refreshProcesses() {
 
 function pingSnapshot() {
   return new Promise((resolve) => {
-    execFile('ping', ['-n', '1', '-w', '1200', '1.1.1.1'], { timeout: 2200, windowsHide: true }, async (err, out) => {
+    execFile('ping', ['-n', '4', '-w', '1200', '1.1.1.1'], { timeout: 6500, windowsHide: true }, async (err, out) => {
       const text = String(out || '');
-      const match = text.match(/(?:time|tempo)[=<]\s*(\d+)\s*ms/i);
-      let selected = null;
+      const samples = [...text.matchAll(/(?:time|tempo)[=<]\s*(\d+)\s*ms/gi)].map(m => Number(m[1]));
+      const latency = samples.length ? Math.round(samples.reduce((sum, value) => sum + value, 0) / samples.length) : null;
+      const jitter = samples.length > 1 ? Math.round(samples.slice(1).reduce((sum, value, index) => sum + Math.abs(value - samples[index]), 0) / (samples.length - 1)) : null;
+      const lossMatch = text.match(/\((\d+)%\s*(?:loss|de perda)\)/i) || text.match(/(\d+)%\s*(?:loss|perda)/i);
+      const packetLoss = lossMatch ? Number(lossMatch[1]) : (samples.length ? Math.round((4 - samples.length) / 4 * 100) : 100);
       try {
-        const interfaces = await si.networkInterfaces();
-        const ignored = /radmin|hamachi|zerotier|tailscale|loopback|teredo|virtual|vpn|tunnel/i;
-        const candidates = interfaces
-          .filter(i => i.operstate === 'up' && !i.internal && !i.virtual && !ignored.test(`${i.iface} ${i.ifaceName}`) && (i.ip4 || i.ip6))
-          .sort((a, b) => Number(Boolean(b.dhcp)) - Number(Boolean(a.dhcp)) || Number(b.speed || 0) - Number(a.speed || 0));
-        selected = candidates.find(i => settings.interface !== 'auto' && i.iface === settings.interface) || candidates[0] || null;
-        const available = candidates.map(i => ({ iface: i.iface, name: i.ifaceName || i.iface, speed: i.speed || null }));
-        resolve({ at: Date.now(), target: '1.1.1.1', latency: match ? Number(match[1]) : null, packetLoss: /Lost\s*=\s*0|Perdidos\s*=\s*0/i.test(text) ? 0 : 100, interface: selected?.iface || null, interfaceName: selected?.ifaceName || null, available, error: err && !match ? 'Destino indisponível' : null });
+        const { selected, available } = await selectedNetworkInterface();
+        resolve({ at: Date.now(), target: '1.1.1.1', latency, jitter, packetLoss, samples, interface: selected?.iface || null, interfaceName: selected?.ifaceName || null, available, error: err && !samples.length ? 'Destino indisponível' : null });
         return;
       } catch {}
-      resolve({ at: Date.now(), target: '1.1.1.1', latency: match ? Number(match[1]) : null, packetLoss: /Lost\s*=\s*0|Perdidos\s*=\s*0/i.test(text) ? 0 : 100, interface: selected?.iface || null, interfaceName: selected?.ifaceName || null, available: [], error: err && !match ? 'Destino indisponível' : null });
+      resolve({ at: Date.now(), target: '1.1.1.1', latency, jitter, packetLoss, samples, interface: null, interfaceName: null, available: [], error: err && !samples.length ? 'Destino indisponível' : null });
     });
   });
 }
@@ -432,9 +512,14 @@ function computeAlerts(data) {
   const t = settings.thresholds;
   if (data?.cpu?.temp != null && data.cpu.temp >= Number(t.cpuTemp)) out.push({ level: 'critical', code: 'CPU_TEMP', message: `CPU em ${Math.round(data.cpu.temp)}°C` });
   if (data?.gpu?.temp != null && data.gpu.temp >= Number(t.gpuTemp)) out.push({ level: 'critical', code: 'GPU_TEMP', message: `GPU em ${Math.round(data.gpu.temp)}°C` });
+  const hotspot = data?.hardware?.gpuHotspot;
+  if (hotspot != null && hotspot >= Number(t.gpuHotspot)) out.push({ level: 'critical', code: 'GPU_HOTSPOT', message: `Hotspot da GPU em ${Math.round(hotspot)}°C` });
+  if (hotspot != null && data?.gpu?.temp != null && hotspot - data.gpu.temp >= Number(t.hotspotDelta)) out.push({ level: 'warn', code: 'GPU_DELTA', message: `Delta térmico da GPU em ${Math.round(hotspot - data.gpu.temp)}°C` });
   for (const disk of data?.disks || []) if (Number(disk.usage) >= Number(t.diskUsage)) out.push({ level: 'warn', code: 'DISK_FULL', message: `${disk.mount || disk.name} em ${Math.round(disk.usage)}%` });
   for (const disk of diskHealthCache.disks || []) if (!/healthy|online|ok/i.test(`${disk.health} ${disk.status}`)) out.push({ level: 'critical', code: 'DISK_HEALTH', message: `${disk.name}: ${disk.health} / ${disk.status}` });
   if (networkHealthCache.latency != null && networkHealthCache.latency >= Number(t.latency)) out.push({ level: 'warn', code: 'LATENCY', message: `Latência ${networkHealthCache.latency} ms` });
+  if (networkHealthCache.jitter != null && networkHealthCache.jitter >= Number(t.jitter)) out.push({ level: 'warn', code: 'JITTER', message: `Jitter ${networkHealthCache.jitter} ms` });
+  if (networkHealthCache.packetLoss != null && networkHealthCache.packetLoss >= Number(t.packetLoss)) out.push({ level: 'critical', code: 'PACKET_LOSS', message: `Perda de pacotes ${networkHealthCache.packetLoss}%` });
   for (const fan of hardwareCache.fans || []) if (fan.enabled && fan.rpm != null && fan.rpm < 150 && !fan.isPump) out.push({ level: 'critical', code: 'FAN_STOP', message: `${fan.name} abaixo de 150 RPM` });
   return out;
 }
@@ -543,13 +628,13 @@ async function snapshot() {
     memory: { used: mem.active, total: mem.total, usage: mem.total ? mem.active / mem.total * 100 : 0 },
     gpu,
     disks: fsSize.filter(d => d.size > 0 && !/^(A:|B:)/i.test(d.fs)).map(d => ({ name:d.fs || d.mount, mount:d.mount, used:d.used, size:d.size, usage:d.use })),
-    network: { ...speed, totalDown: net.rx, totalUp: net.tx },
+    network: { ...speed, totalDown: net.rx, totalUp: net.tx, interface: net.iface || networkHealthCache.interface || null, interfaceName: net.ifaceName || networkHealthCache.interfaceName || null },
     hardware: hardwareCache,
     diskHealth: diskHealthCache
   };
   history.push({ t:now, cpu:data.cpu.usage, gpu:gpu?.usage || 0, down:speed.down, up:speed.up });
   if (history.length > 180) history.shift();
-  longHistory.push({ t: now, cpu: Number(data.cpu.usage.toFixed(1)), gpu: Number((gpu?.usage || 0).toFixed(1)), ram: Number(data.memory.usage.toFixed(1)), down: Number(speed.down.toFixed(0)), up: Number(speed.up.toFixed(0)), cpuTemp: data.cpu.temp == null ? null : Number(data.cpu.temp.toFixed(1)), gpuTemp: gpu?.temp ?? null });
+  longHistory.push({ t: now, cpu: Number(data.cpu.usage.toFixed(1)), gpu: Number((gpu?.usage || 0).toFixed(1)), ram: Number(data.memory.usage.toFixed(1)), down: Number(speed.down.toFixed(0)), up: Number(speed.up.toFixed(0)), cpuTemp: data.cpu.temp == null ? null : Number(data.cpu.temp.toFixed(1)), gpuTemp: gpu?.temp ?? null, gpuHotspot: hardwareCache.gpuHotspot ?? null, latency: networkHealthCache.latency ?? null, jitter: networkHealthCache.jitter ?? null, packetLoss: networkHealthCache.packetLoss ?? null });
   const maxHistory = Math.max(360, Math.min(8640, Number(settings.historyHours || 24) * 60));
   if (longHistory.length > maxHistory) longHistory.splice(0, longHistory.length - maxHistory);
   historyDirty = true;
@@ -611,17 +696,19 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/agent/pairing')) {
-    json(res, 200, { ok: true, token: agentData.token, host: HOST, port: PORT, googleConfigured: googleConfigured(), googleConnected: Boolean(agentData.google?.refresh_token || agentData.google?.access_token) });
+    const code = new URL(req.url, `http://${HOST}:${PORT}`).searchParams.get('code');
+    if (!isLoopbackRequest(req) && code !== agentData.pairingCode) { json(res, 401, { ok: false, requiresPairing: true, error: 'Digite o código de pareamento exibido no PC.' }); return; }
+    json(res, 200, { ok: true, token: agentData.token, pairingCode: isLoopbackRequest(req) ? agentData.pairingCode : undefined, host: HOST, port: PORT, googleConfigured: googleConfigured(), googleConnected: Boolean(agentData.google?.refresh_token || agentData.google?.access_token) });
     return;
   }
   if (req.url.startsWith('/api/agent/status')) {
     if (!requireAgent(req, res)) return;
-    json(res, 200, { ok: true, agent: 'JARVIS', version: APP_VERSION, host: HOST, port: PORT, googleConfigured: googleConfigured(), googleConnected: Boolean(agentData.google?.refresh_token || agentData.google?.access_token), reminders: agentData.reminders.filter(r => !r.done).length, capabilities: ['pc.status', 'pc.open.safe', 'reminders.local', 'gmail.read', 'calendar.read', 'calendar.create'] });
+    json(res, 200, { ok: true, agent: 'JARVIS', version: APP_VERSION, host: HOST, port: PORT, aiConfigured: aiConfigured(), googleConfigured: googleConfigured(), googleConnected: Boolean(agentData.google?.refresh_token || agentData.google?.access_token), reminders: agentData.reminders.filter(r => !r.done).length, pendingAction: agentData.pendingActions[0] || null, settings: agentData.settings, capabilities: ['chat.openai', 'pc.status', 'pc.open.safe', 'reminders.local', 'gmail.read', 'calendar.read', 'calendar.create.confirmed'] });
     return;
   }
   if (req.url.startsWith('/api/agent/command') && req.method === 'POST') {
     if (!requireAgent(req, res)) return;
-    try { const body = await readJson(req); const input = String(body.text || body.command || ''); addConversation('user', input); const answer = await runAgentCommand(input); addConversation('assistant', answer); json(res, 200, { ok: true, answer, at: Date.now() }); }
+    try { const body = await readJson(req); const input = String(body.text || body.command || ''); const answer = await runAgentCommand(input); addConversation('user', input); addConversation('assistant', answer); json(res, 200, { ok: true, answer, at: Date.now(), pendingAction: agentData.pendingActions[0] || null }); }
     catch (e) { json(res, 400, { ok: false, error: e.message }); }
     return;
   }
@@ -632,7 +719,17 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.url.startsWith('/api/agent/conversation')) {
     if (!requireAgent(req, res)) return;
-    json(res, 200, { messages: agentData.conversations.slice(-30) }); return;
+    if (req.method === 'DELETE') { agentData.conversations = []; saveAgentData(); json(res, 200, { ok: true }); return; }
+    json(res, 200, { messages: agentData.conversations.slice(-60) }); return;
+  }
+  if (req.url.startsWith('/api/agent/settings')) {
+    if (!requireAgent(req, res)) return;
+    if (req.method === 'POST') {
+      try { const incoming = await readJson(req); agentData.settings = { ...agentData.settings, voiceEnabled: Boolean(incoming.voiceEnabled) }; saveAgentData(); json(res, 200, { ok: true, settings: agentData.settings }); }
+      catch (e) { json(res, 400, { ok: false, error: e.message }); }
+      return;
+    }
+    json(res, 200, { settings: agentData.settings }); return;
   }
   if (req.url.startsWith('/api/hardware')) {
     try { const data = hardwareCache.at ? hardwareCache : await refreshHardware(); res.writeHead(200, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}); res.end(JSON.stringify(data)); }
@@ -640,6 +737,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/fans/open') && req.method === 'POST') {
+    if (!requireAgent(req, res)) return;
     try { execFile(fanControlExe, [], { windowsHide: true }, () => {}); res.writeHead(200, {'Content-Type':'application/json'}); res.end('{"ok":true}'); }
     catch (e) { res.writeHead(500, {'Content-Type':'application/json'}); res.end(JSON.stringify({error:e.message})); }
     return;
@@ -674,11 +772,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/network/capture/start') && req.method === 'POST') {
+    if (!requireAgent(req, res)) return;
     try { const data = await startCapture(); res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify({ ok: true, ...data })); }
     catch (e) { res.writeHead(400, {'Content-Type':'application/json'}); res.end(JSON.stringify({ok:false,error:e.message})); }
     return;
   }
   if (req.url.startsWith('/api/network/capture/stop') && req.method === 'POST') {
+    if (!requireAgent(req, res)) return;
     res.writeHead(200, {'Content-Type':'application/json'}); res.end(JSON.stringify({ ok: true, ...stopCapture() }));
     return;
   }
@@ -703,6 +803,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.url.startsWith('/api/settings') && req.method === 'POST') {
+    if (!requireAgent(req, res)) return;
     try {
       const incoming = await readJson(req);
       settings = { ...settings, ...incoming, thresholds: { ...settings.thresholds, ...(incoming.thresholds || {}) } };
