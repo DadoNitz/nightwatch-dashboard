@@ -8,7 +8,7 @@ const si = require('systeminformation');
 const PORT = Number(process.env.PORT || 4280);
 const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC = path.join(__dirname, 'public');
-const APP_VERSION = '2026.08.14.2';
+const APP_VERSION = '2026.08.14.3';
 
 let lastNet = null;
 let lastAt = Date.now();
@@ -58,8 +58,9 @@ try { longHistory = JSON.parse(fs.readFileSync(historyFile, 'utf8')); if (!Array
 let historyDirty = false;
 
 const agentDataFile = path.join(__dirname, 'jarvis.agent.json');
-let agentData = { token: crypto.randomBytes(24).toString('hex'), reminders: [], conversations: [], google: null };
+let agentData = { token: crypto.randomBytes(24).toString('hex'), reminders: [], conversations: [], google: null, settings: { voiceEnabled: false } };
 try { agentData = { ...agentData, ...JSON.parse(fs.readFileSync(agentDataFile, 'utf8')) }; } catch {}
+agentData.settings = { voiceEnabled: false, ...(agentData.settings || {}) };
 function saveAgentData() { try { fs.writeFileSync(agentDataFile, JSON.stringify(agentData, null, 2)); } catch (err) { console.error('Falha ao salvar dados do Jarvis:', err.message); } }
 saveAgentData();
 
@@ -81,6 +82,7 @@ function requireAgent(req, res) { if (agentAuthorized(req)) return true; json(re
 function decodeBase64Url(value) { return Buffer.from(String(value || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'); }
 function extractHeader(headers, name) { return (headers || []).find(h => String(h.name).toLowerCase() === name.toLowerCase())?.value || ''; }
 function googleConfigured() { return Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET); }
+function aiConfigured() { return Boolean(process.env.OPENAI_API_KEY); }
 function googleAuthUrl() {
   const params = new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID || '', redirect_uri: googleRedirect, response_type: 'code', access_type: 'offline', prompt: 'consent', scope: googleScopes.join(' ') });
   return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
@@ -126,8 +128,20 @@ async function googleCreateEvent(title, start, minutes = 60) {
   return googleApi('https://www.googleapis.com/calendar/v3/calendars/primary/events', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ summary: title, start: { dateTime: begin.toISOString() }, end: { dateTime: finish.toISOString() }, reminders: { useDefault: true } }) });
 }
 function formatRate(bytesPerSecond) { const mbps = Number(bytesPerSecond || 0) * 8 / 1e6; return mbps.toFixed(mbps < 10 ? 2 : 1); }
-function formatPcStatus(d) { return `CPU ${Math.round(d.cpu.usage)}%${d.cpu.temp != null ? ` / ${Math.round(d.cpu.temp)}°C` : ''}, GPU ${d.gpu ? `${Math.round(d.gpu.usage)}% / ${Math.round(d.gpu.temp)}°C` : 'offline'}, RAM ${Math.round(d.memory.usage)}%, download ${formatRate(d.network.down)} Mbps, upload ${formatRate(d.network.up)} Mbps.`; }
+function formatPcStatus(d) { const hotspot = d.hardware?.gpuHotspot; return `CPU ${Math.round(d.cpu.usage)}%${d.cpu.temp != null ? ` / ${Math.round(d.cpu.temp)}°C` : ''}, GPU ${d.gpu ? `${Math.round(d.gpu.usage)}% / ${Math.round(d.gpu.temp)}°C${hotspot != null ? ` / hotspot ${Math.round(hotspot)}°C` : ''}` : 'offline'}, RAM ${Math.round(d.memory.usage)}%, download ${formatRate(d.network.down)} Mbps, upload ${formatRate(d.network.up)} Mbps.`; }
 function addConversation(role, content) { agentData.conversations.push({ role, content, at: Date.now() }); agentData.conversations = agentData.conversations.slice(-40); saveAgentData(); }
+async function llmReply(input) {
+  if (!aiConfigured()) return null;
+  const messages = [
+    { role: 'system', content: 'Você é JARVIS, um assistente pessoal em português do Brasil. Seja natural, útil e conciso. Você está integrado a um PC Windows e pode executar somente ferramentas explicitamente permitidas pelo servidor. Não invente ações realizadas. Se algo exigir confirmação ou integração ainda não conectada, explique claramente.' },
+    ...agentData.conversations.slice(-18).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content) })),
+    { role: 'user', content: input }
+  ];
+  const response = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || 'gpt-4o-mini', messages, temperature: 0.35, max_tokens: 700 }) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error?.message || `OpenAI HTTP ${response.status}`);
+  return data.choices?.[0]?.message?.content?.trim() || null;
+}
 function safeOpen(name) {
   const apps = { notepad: 'notepad.exe', bloco: 'notepad.exe', calculadora: 'calc.exe', calculator: 'calc.exe', explorer: 'explorer.exe', arquivos: 'explorer.exe', taskmgr: 'taskmgr.exe', tarefas: 'taskmgr.exe', discord: `${process.env.LOCALAPPDATA || ''}\\Discord\\Update.exe`, steam: 'steam.exe', spotify: 'spotify.exe', navegador: 'msedge.exe', edge: 'msedge.exe', brave: 'brave.exe' };
   const key = String(name || '').toLowerCase().trim();
@@ -158,6 +172,12 @@ async function runAgentCommand(input) {
   if (/agenda|calendário|compromissos|eventos/i.test(lower)) { const events = await googleCalendar(); return events.length ? events.map(e => `• ${e.title} — ${new Date(e.start).toLocaleString('pt-BR')}${e.location ? ` (${e.location})` : ''}`).join('\n') : 'Não há eventos nos próximos 7 dias.'; }
   if (/email|gmail|caixa de entrada|mensagens/i.test(lower)) { const messages = await googleInbox(); return messages.length ? messages.map(m => `• ${m.subject || '(sem assunto)'} — ${m.from}\n  ${m.snippet}`).join('\n') : 'Nenhum email recente encontrado.'; }
   if (/^crie|agende|marque/i.test(lower) && /evento|reunião|compromisso/i.test(lower)) return 'Posso criar eventos no Google Calendar, mas preciso de título e horário exatos. Exemplo: “agende reunião amanhã às 14h”.';
+  if (/^(oi|olá|ola|hey|bom dia|boa tarde|boa noite|tudo bem|obrigado|valeu)/i.test(lower)) {
+    if (aiConfigured()) return (await llmReply(text)) || 'Olá. Estou online e pronto para ajudar.';
+    return 'Olá. Estou online e pronto para ajudar no PC, nos lembretes e nas integrações disponíveis.';
+  }
+  const conversational = await llmReply(text);
+  if (conversational) return conversational;
   return 'Entendi, mas ainda não tenho uma ferramenta segura para essa ação. Tente “status do PC”, “abra o Discord”, “me lembre em 20 minutos de…”, “ver minha agenda” ou “ler meus emails”.';
 }
 
@@ -483,6 +503,8 @@ function hardwareSnapshot() {
       const sensors = raw.sensors || [];
       const temperatures = sensors.filter(s => s.type === 'Temperature');
       const cpuTemperatures = temperatures.filter(s => /cpu|processor|ryzen|core|package|tctl|tdie/i.test(`${s.hardware} ${s.name} ${s.id}`));
+      const gpuTemperatures = temperatures.filter(s => /gpu|nvidia|rtx|graphics|video/i.test(`${s.hardware} ${s.name} ${s.id}`));
+      const gpuHotspot = gpuTemperatures.find(s => /hotspot|junction|hot spot/i.test(`${s.hardware} ${s.name} ${s.id}`)) || null;
       const priority = s => /package|tctl|tdie/i.test(s.name) ? 3 : /core average|cpu/i.test(s.name) ? 2 : 1;
       const cpuSensor = cpuTemperatures.sort((a, b) => priority(b) - priority(a))[0] || null;
       const sensorById = new Map(sensors.map(s => [s.id, s]));
@@ -492,7 +514,7 @@ function hardwareSnapshot() {
       for (const sensor of sensors.filter(s => s.type === 'Rpm' && !usedFanIds.has(s.id))) {
         fans.push({ id: sensor.id, fanId: sensor.id, name: sensor.name, enabled: true, mode: 'Monitor', configuredPercent: null, curve: null, isPump: /pump|bomba/i.test(sensor.name), rpm: sensor.value, percent: null });
       }
-      resolve({ ok: Boolean(raw.ok), at: raw.at || Date.now(), cpuTemp: cpuSensor?.value ?? null, cpuSensor: cpuSensor?.name || null, fans, temperatures: temperatures.slice(0, 12), error: raw.ok ? null : (raw.error || err?.message || 'Sensores indisponíveis') });
+      resolve({ ok: Boolean(raw.ok), at: raw.at || Date.now(), cpuTemp: cpuSensor?.value ?? null, cpuSensor: cpuSensor?.name || null, gpuHotspot: gpuHotspot?.value ?? null, gpuHotspotSensor: gpuHotspot?.name || null, fans, temperatures: temperatures.slice(0, 12), error: raw.ok ? null : (raw.error || err?.message || 'Sensores indisponíveis') });
     });
   });
 }
